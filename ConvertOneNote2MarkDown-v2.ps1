@@ -29,6 +29,198 @@ Function Validate-Dependencies {
     }
 }
 
+# Add this function to your ConvertOneNote2MarkDown.ps1 script
+Function Convert-DocxOutlineToBullets {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$FilePath,
+        [int]$Timeout = 30
+    )
+    
+    try {
+        # Start Word
+        Write-Verbose "Starting Word to convert indented outlines to bullet lists..."
+        $Word = New-Object -ComObject Word.Application
+        $Word.Visible = $false
+        $Word.DisplayAlerts = 0
+
+        # Open the document
+        Write-Verbose "Opening document: $FilePath"
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $doc = $Word.Documents.Open($FilePath)
+        if($sw.Elapsed.TotalSeconds -gt $Timeout) { 
+            throw "Timeout opening document: $FilePath" 
+        }
+        
+        # Collect paragraphs - use array subexpression operator for safe Count access
+        $paras = $doc.Paragraphs
+        $paraCount = @($paras).Count
+        Write-Verbose "Found $paraCount paragraphs"
+
+        # Find groups of consecutive indented paras that are NOT already lists
+        $groups = @()
+        $grp = $null
+        
+        for($i=1; $i -le $paraCount; $i++) {
+            $p = $paras.Item($i)
+            if ($null -eq $p) { continue }
+            
+            $text = $p.Range.Text.Trim()
+            if($text -eq '') { continue }
+            
+            # Skip paragraphs that are already lists
+            if ($p.Range.ListFormat.ListType -ne 0) {
+                # End current group if we hit an existing list
+                if ($null -ne $grp) {
+                    $groups += $grp
+                    $grp = $null
+                }
+                continue 
+            }
+            
+            $indent = $p.Format.LeftIndent
+
+            if($indent -gt 0) {
+                if($null -eq $grp) {
+                    $grp = @{ Items = @(); Indents = @{} }
+                }
+                $grp.Items += $i
+                $grp.Indents[$indent] = $true
+            }
+            elseif($indent -eq 0 -and $grp) {
+                $groups += $grp
+                $grp = $null
+            }
+        }
+        
+        if($grp) { $groups += $grp }
+        
+        # Safe count using array subexpression
+        $groupCount = @($groups).Count
+        Write-Verbose "Found $groupCount groups of indented paragraphs to convert"
+
+        # Skip if no indented groups found
+        if ($groupCount -eq 0) {
+            Write-Verbose "No indented paragraphs found in document"
+            $doc.Close(0)
+            $Word.Quit()
+            [System.Runtime.Interopservices.Marshal]::ReleaseComObject($paras) | Out-Null
+            [System.Runtime.Interopservices.Marshal]::ReleaseComObject($doc) | Out-Null
+            [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Word) | Out-Null
+            [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+            return $false
+        }
+
+        # Define Word constants
+        $wdOutlineNumberGallery = 3
+        $wdListLevelAlignLeft = 0
+        $wdListBullet = 23
+
+        # Get the outline gallery and template
+        $gallery = $Word.ListGalleries.Item($wdOutlineNumberGallery)
+        $template = $gallery.ListTemplates.Item(1)
+
+        # Convert the template levels to use bullets
+        for ($i = 1; $i -le 9; $i++) {
+            $level = $template.ListLevels.Item($i)
+            $level.NumberFormat = "-"
+            $level.NumberStyle = $wdListBullet
+            $level.Alignment = $wdListLevelAlignLeft
+        }
+
+        # Convert each group - with safe array handling
+        foreach($g in $groups) {
+            # Skip if group is null or has no items
+            if ($null -eq $g) { continue }
+            if ($null -eq $g.Items) { continue }
+            
+            # Force array handling for Items
+            $items = @($g.Items)
+            $itemCount = $items.Count
+            
+            if ($itemCount -eq 0) { continue }
+            
+            Write-Verbose "Processing group with $itemCount items"
+            
+            # Map each distinct indent to a 1-based level
+            # Force array handling for Indents.Keys
+            $indentKeys = @($g.Indents.Keys)
+            $levels = @($indentKeys | Sort-Object)
+            $map = @{}
+            
+            for($i=0; $i -lt $levels.Count; $i++) {
+                $map[$levels[$i]] = $i + 1
+            }
+
+            # First para: start new list
+            $firstIdx = $items[0]
+            $first = $paras.Item($firstIdx)
+            $lvl = $map[$first.Format.LeftIndent]
+            
+            $first.Range.ListFormat.RemoveNumbers()
+            $first.Format.LeftIndent = 0
+            $first.Range.ListFormat.ApplyListTemplateWithLevel(
+                $template,
+                $false,  # Start new list
+                1,       # Apply to whole list
+                $null,
+                $lvl
+            )
+
+            # Rest: continue same list
+            if ($itemCount -gt 1) {
+                for($j=1; $j -lt $itemCount; $j++) {
+                    $idx = $items[$j]
+                    $pp = $paras.Item($idx)
+                    $lvl = $map[$pp.Format.LeftIndent]
+                    
+                    $pp.Range.ListFormat.RemoveNumbers()
+                    $pp.Format.LeftIndent = 0
+                    $pp.Range.ListFormat.ApplyListTemplateWithLevel(
+                        $template,
+                        $true,  # Continue list
+                        1,      # Apply to whole list
+                        $null,
+                        $lvl
+                    )
+                }
+            }
+        }
+
+        # Save the document
+        Write-Verbose "Saving document with bullet lists applied: $FilePath"
+        $doc.Save()
+        
+        # Clean up
+        $doc.Close()
+        $Word.Quit()
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($paras) | Out-Null
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($doc) | Out-Null
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Word) | Out-Null
+        [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+        
+        return $true
+    }
+    catch {
+        Write-Error "Failed to convert outlines to bullets: $_"
+        
+        # Clean up in case of error
+        if($null -ne $doc){ 
+            try { $doc.Close(0) } catch {}
+            try { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($doc) | Out-Null } catch {}
+        }
+        if($null -ne $Word){ 
+            try { $Word.Quit() } catch {}
+            try { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Word) | Out-Null } catch {}
+        }
+        
+        [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+        return $false
+    }
+}
+
+
 Function Get-DefaultConfiguration {
     [CmdletBinding()]
     param ()
@@ -1141,6 +1333,7 @@ Function Convert-OneNotePage {
             }else {
                 "Existing docx file: $( $pageCfg['docxExportFilePath'] )" | Write-Verbose
             }
+			
 
             # Publish OneNote page to pdf, don't proceed if it fails
             if ($config['exportPdf']['value'] -eq 2) {
@@ -1160,6 +1353,15 @@ Function Convert-OneNotePage {
                     "Existing pdf file: $( $pageCfg['pdfExportFilePath'] )" | Write-Host -ForegroundColor Green
                 }
             }
+			
+			# NEW CODE: Convert indented outlines to bullet lists
+			if (!$config['dryRun']['value']) {
+				"Converting indented outlines to bullet lists in: $( $pageCfg['docxExportFilePath'] )" | Write-Verbose
+				$bulletConversion = Convert-DocxOutlineToBullets -FilePath $pageCfg['docxExportFilePath']
+				if ($bulletConversion) {
+					"Successfully converted outlines to bullet lists" | Write-Verbose
+				}
+			}
 
             # https://gist.github.com/heardk/ded40b72056cee33abb18f3724e0a580
             # Convert .docx to .md, don't proceed if it fails
