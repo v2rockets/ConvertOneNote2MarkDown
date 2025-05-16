@@ -1,3 +1,7 @@
+# About the fork
+* added additional functionality to convert OneNote indented outlines to Markdown bullet lists as well
+ 
+---
 # Convert OneNote to MarkDown
 
 [![github-actions](https://github.com/theohbrothers/ConvertOneNote2MarkDown/actions/workflows/ci-master-pr.yml/badge.svg?branch=master)](https://github.com/theohbrothers/ConvertOneNote2MarkDown/actions/workflows/ci-master-pr.yml)
