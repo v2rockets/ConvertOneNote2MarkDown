@@ -29,7 +29,6 @@ Function Validate-Dependencies {
     }
 }
 
-# Add this function to your ConvertOneNote2MarkDown.ps1 script
 Function Convert-DocxOutlineToBullets {
     [CmdletBinding()]
     param(
@@ -39,186 +38,719 @@ Function Convert-DocxOutlineToBullets {
     )
     
     try {
-        # Start Word
-        Write-Verbose "Starting Word to convert indented outlines to bullet lists..."
-        $Word = New-Object -ComObject Word.Application
-        $Word.Visible = $false
-        $Word.DisplayAlerts = 0
-
-        # Open the document
-        Write-Verbose "Opening document: $FilePath"
-        $sw = [Diagnostics.Stopwatch]::StartNew()
-        $doc = $Word.Documents.Open($FilePath)
-        if($sw.Elapsed.TotalSeconds -gt $Timeout) { 
-            throw "Timeout opening document: $FilePath" 
+        Write-Verbose "Converting indented outline to bullet lists in: $FilePath"
+        
+        # Create temp directory with unique name
+        $tempDir = Join-Path $env:TEMP "docx-$(Get-Date -Format yyyyMMddHHmmss)"
+        $null = New-Item -ItemType Directory -Path $tempDir -Force
+        Write-Verbose "Created temp directory: $tempDir"
+        
+        # Define paths within the DOCX structure
+        $paths = @{
+            Numbering     = Join-Path $tempDir "word\numbering.xml"
+            Document      = Join-Path $tempDir "word\document.xml"
+            ContentTypes  = Join-Path $tempDir "[Content_Types].xml"
+            Relationships = Join-Path $tempDir "word\_rels\document.xml.rels"
         }
         
-        # Collect paragraphs - use array subexpression operator for safe Count access
-        $paras = $doc.Paragraphs
-        $paraCount = @($paras).Count
-        Write-Verbose "Found $paraCount paragraphs"
-
-        # Find groups of consecutive indented paras that are NOT already lists
-        $groups = @()
-        $grp = $null
-        
-        for($i=1; $i -le $paraCount; $i++) {
-            $p = $paras.Item($i)
-            if ($null -eq $p) { continue }
-            
-            $text = $p.Range.Text.Trim()
-            if($text -eq '') { continue }
-            
-            # Skip paragraphs that are already lists
-            if ($p.Range.ListFormat.ListType -ne 0) {
-                # End current group if we hit an existing list
-                if ($null -ne $grp) {
-                    $groups += $grp
-                    $grp = $null
-                }
-                continue 
-            }
-            
-            $indent = $p.Format.LeftIndent
-
-            if($indent -gt 0) {
-                if($null -eq $grp) {
-                    $grp = @{ Items = @(); Indents = @{} }
-                }
-                $grp.Items += $i
-                $grp.Indents[$indent] = $true
-            }
-            elseif($indent -eq 0 -and $grp) {
-                $groups += $grp
-                $grp = $null
-            }
+        # Extract DOCX contents
+        try {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($FilePath, $tempDir)
+            Write-Verbose "Successfully extracted DOCX contents"
+        }
+        catch {
+            throw "Failed to extract DOCX file: $_"
         }
         
-        if($grp) { $groups += $grp }
-        
-        # Safe count using array subexpression
-        $groupCount = @($groups).Count
-        Write-Verbose "Found $groupCount groups of indented paragraphs to convert"
-
-        # Skip if no indented groups found
-        if ($groupCount -eq 0) {
-            Write-Verbose "No indented paragraphs found in document"
-            $doc.Close(0)
-            $Word.Quit()
-            [System.Runtime.Interopservices.Marshal]::ReleaseComObject($paras) | Out-Null
-            [System.Runtime.Interopservices.Marshal]::ReleaseComObject($doc) | Out-Null
-            [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Word) | Out-Null
-            [GC]::Collect(); [GC]::WaitForPendingFinalizers()
-            return $false
-        }
-
-        # Define Word constants
-        $wdOutlineNumberGallery = 3
-        $wdListLevelAlignLeft = 0
-        $wdListBullet = 23
-
-        # Get the outline gallery and template
-        $gallery = $Word.ListGalleries.Item($wdOutlineNumberGallery)
-        $template = $gallery.ListTemplates.Item(1)
-
-        # Convert the template levels to use bullets
-        for ($i = 1; $i -le 9; $i++) {
-            $level = $template.ListLevels.Item($i)
-            $level.NumberFormat = "-"
-            $level.NumberStyle = $wdListBullet
-            $level.Alignment = $wdListLevelAlignLeft
-        }
-
-        # Convert each group - with safe array handling
-        foreach($g in $groups) {
-            # Skip if group is null or has no items
-            if ($null -eq $g) { continue }
-            if ($null -eq $g.Items) { continue }
+        # Create numbering.xml if it doesn't exist
+        if (-not (Test-Path -LiteralPath $paths.Numbering)) {
+            Write-Verbose "Creating bullet list definition"
             
-            # Force array handling for Items
-            $items = @($g.Items)
-            $itemCount = $items.Count
-            
-            if ($itemCount -eq 0) { continue }
-            
-            Write-Verbose "Processing group with $itemCount items"
-            
-            # Map each distinct indent to a 1-based level
-            # Force array handling for Indents.Keys
-            $indentKeys = @($g.Indents.Keys)
-            $levels = @($indentKeys | Sort-Object)
-            $map = @{}
-            
-            for($i=0; $i -lt $levels.Count; $i++) {
-                $map[$levels[$i]] = $i + 1
-            }
-
-            # First para: start new list
-            $firstIdx = $items[0]
-            $first = $paras.Item($firstIdx)
-            $lvl = $map[$first.Format.LeftIndent]
-            
-            $first.Range.ListFormat.RemoveNumbers()
-            $first.Format.LeftIndent = 0
-            $first.Range.ListFormat.ApplyListTemplateWithLevel(
-                $template,
-                $false,  # Start new list
-                1,       # Apply to whole list
-                $null,
-                $lvl
+            # Define bullet characters and fonts for each level
+            $bulletDefs = @(
+                @{ Char = [char]0x2022; Font = "Symbol" },      # • bullet
+                @{ Char = [char]0x006F; Font = "Courier New" }, # o lowercase
+                @{ Char = [char]0x25AA; Font = "Wingdings" }    # ▪ small square
             )
-
-            # Rest: continue same list
-            if ($itemCount -gt 1) {
-                for($j=1; $j -lt $itemCount; $j++) {
-                    $idx = $items[$j]
-                    $pp = $paras.Item($idx)
-                    $lvl = $map[$pp.Format.LeftIndent]
-                    
-                    $pp.Range.ListFormat.RemoveNumbers()
-                    $pp.Format.LeftIndent = 0
-                    $pp.Range.ListFormat.ApplyListTemplateWithLevel(
-                        $template,
-                        $true,  # Continue list
-                        1,      # Apply to whole list
-                        $null,
-                        $lvl
-                    )
-                }
+            
+            # Create the XML structure
+            $sb = [System.Text.StringBuilder]::new()
+            $null = $sb.AppendLine('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>')
+            $null = $sb.AppendLine('<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">')
+            $null = $sb.AppendLine('  <w:abstractNum w:abstractNumId="0">')
+            $null = $sb.AppendLine('    <w:nsid w:val="1BCA9C16"/>')
+            $null = $sb.AppendLine('    <w:multiLevelType w:val="hybridMultilevel"/>')
+            $null = $sb.AppendLine('    <w:tmpl w:val="7D26016A"/>')
+            
+            # Generate level definitions
+            for ($i = 0; $i -lt 9; $i++) {
+                $bulletDef = $bulletDefs[$i % 3]
+                $indent = 720 * ($i + 1)
+                
+                $null = $sb.AppendLine("    <w:lvl w:ilvl=""$i"" w:tplc=""0409000F"">")
+                $null = $sb.AppendLine('      <w:start w:val="1"/>')
+                $null = $sb.AppendLine('      <w:numFmt w:val="bullet"/>')
+                $null = $sb.AppendLine("      <w:lvlText w:val=""$($bulletDef.Char)""/>")
+                $null = $sb.AppendLine('      <w:lvlJc w:val="left"/>')
+                $null = $sb.AppendLine('      <w:pPr>')
+                $null = $sb.AppendLine("        <w:ind w:left=""$indent"" w:hanging=""360""/>")
+                $null = $sb.AppendLine('      </w:pPr>')
+                $null = $sb.AppendLine('      <w:rPr>')
+                $null = $sb.AppendLine("        <w:rFonts w:ascii=""$($bulletDef.Font)"" w:hAnsi=""$($bulletDef.Font)"" w:hint=""default""/>")
+                $null = $sb.AppendLine('      </w:rPr>')
+                $null = $sb.AppendLine('    </w:lvl>')
+            }
+            
+            # Close the XML structure
+            $null = $sb.AppendLine('  </w:abstractNum>')
+            $null = $sb.AppendLine('  <w:num w:numId="1">')
+            $null = $sb.AppendLine('    <w:abstractNumId w:val="0"/>')
+            $null = $sb.AppendLine('  </w:num>')
+            $null = $sb.AppendLine('</w:numbering>')
+            
+            # Write the XML with UTF-8 encoding (no BOM)
+            [System.IO.File]::WriteAllText($paths.Numbering, $sb.ToString(), [System.Text.Encoding]::UTF8)
+            
+            # Update content types and relationships
+            Update-DocxReferences -Paths $paths
+        }
+        
+        # Process document to convert indents to bullets
+        if (Test-Path -LiteralPath $paths.Document) {
+            $success = Convert-DocxIndentsToBullets -DocumentPath $paths.Document
+            if (-not $success) {
+                Write-Warning "No indented paragraphs were converted to bullets"
             }
         }
-
-        # Save the document
-        Write-Verbose "Saving document with bullet lists applied: $FilePath"
-        $doc.Save()
+        else {
+            throw "Document XML not found: $($paths.Document)"
+        }
         
-        # Clean up
-        $doc.Close()
-        $Word.Quit()
-        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($paras) | Out-Null
-        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($doc) | Out-Null
-        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Word) | Out-Null
-        [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+        # Repackage the DOCX
+        Write-Verbose "Repackaging DOCX file..."
+        $tempFile = [System.IO.Path]::GetTempFileName()
+        if (Test-Path $tempFile) { Remove-Item $tempFile -Force }
         
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($tempDir, $tempFile)
+        Move-Item -Path $tempFile -Destination $FilePath -Force
+        
+        Write-Verbose "Successfully converted indented paragraphs to bullet lists in: $FilePath"
         return $true
     }
     catch {
-        Write-Error "Failed to convert outlines to bullets: $_"
-        
-        # Clean up in case of error
-        if($null -ne $doc){ 
-            try { $doc.Close(0) } catch {}
-            try { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($doc) | Out-Null } catch {}
-        }
-        if($null -ne $Word){ 
-            try { $Word.Quit() } catch {}
-            try { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Word) | Out-Null } catch {}
-        }
-        
-        [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+        Write-Error "Error converting indented paragraphs: $_"
         return $false
     }
+    finally {
+        # Clean up temp directory
+        if ($tempDir -and (Test-Path $tempDir)) {
+            Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
+
+function Update-DocxReferences {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [hashtable]$Paths
+    )
+    
+    # Update content types to include numbering
+    if (Test-Path -LiteralPath $Paths.ContentTypes) {
+        $contentTypesXml = [xml](Get-Content -LiteralPath $Paths.ContentTypes | Out-String)
+        $nsManager = New-Object System.Xml.XmlNamespaceManager($contentTypesXml.NameTable)
+        $nsManager.AddNamespace("ct", "http://schemas.openxmlformats.org/package/2006/content-types")
+        
+        $numberingType = $contentTypesXml.SelectSingleNode("//ct:Override[@PartName='/word/numbering.xml']", $nsManager)
+        if (-not $numberingType) {
+            $numberingOverride = $contentTypesXml.CreateElement("Override", "http://schemas.openxmlformats.org/package/2006/content-types")
+            $numberingOverride.SetAttribute("PartName", "/word/numbering.xml")
+            $numberingOverride.SetAttribute("ContentType", "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml")
+            $contentTypesXml.Types.AppendChild($numberingOverride) | Out-Null
+            $contentTypesXml.Save($Paths.ContentTypes)
+            Write-Verbose "Updated content types to include numbering"
+        }
+    }
+    
+    # Update relationships to include numbering
+    if (Test-Path -LiteralPath $Paths.Relationships) {
+        $relsXml = [xml](Get-Content -LiteralPath $Paths.Relationships | Out-String)
+        $nsManager = New-Object System.Xml.XmlNamespaceManager($relsXml.NameTable)
+        $nsManager.AddNamespace("rel", "http://schemas.openxmlformats.org/package/2006/relationships")
+        
+        $numberingRel = $relsXml.SelectSingleNode("//rel:Relationship[@Target='numbering.xml']", $nsManager)
+        if (-not $numberingRel) {
+            $maxId = 0
+            foreach ($rel in $relsXml.Relationships.Relationship) {
+                $idNum = [int]($rel.Id -replace "rId", "")
+                if ($idNum -gt $maxId) { $maxId = $idNum }
+            }
+            
+            $newRelId = "rId$($maxId + 1)"
+            $newRel = $relsXml.CreateElement("Relationship", "http://schemas.openxmlformats.org/package/2006/relationships")
+            $newRel.SetAttribute("Id", $newRelId)
+            $newRel.SetAttribute("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering")
+            $newRel.SetAttribute("Target", "numbering.xml")
+            $relsXml.Relationships.AppendChild($newRel) | Out-Null
+            $relsXml.Save($Paths.Relationships)
+            Write-Verbose "Updated relationships to include numbering"
+        }
+    }
+}
+
+Function Convert-DocxOutlineToBullets {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$FilePath,
+        [int]$Timeout = 30
+    )
+    
+    try {
+        Write-Verbose "Converting indented outline to bullet lists in: $FilePath"
+        
+        # Create temp directory
+        $tempDir = Join-Path $env:TEMP "docx-$(Get-Date -Format yyyyMMddHHmmss)"
+        New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+        Write-Verbose "Created temp directory: $tempDir"
+        
+        # Load required assembly for ZIP operations
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        
+        # Extract DOCX contents (DOCX is just a ZIP file)
+        Write-Verbose "Extracting DOCX contents..."
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($FilePath, $tempDir)
+        
+        # Define paths
+        $numberingPath = Join-Path $tempDir "word\numbering.xml"
+        $documentPath = Join-Path $tempDir "word\document.xml"
+        $contentTypesPath = Join-Path $tempDir "[Content_Types].xml"
+        $relsPath = Join-Path $tempDir "word\_rels\document.xml.rels"
+        
+        Write-Verbose "Document Path: $documentPath"
+        Write-Verbose "Content Types Path: $contentTypesPath"
+        Write-Verbose "Rels Path: $relsPath"
+        
+        # Create or update numbering.xml with bullet list definition
+        if (-not (Test-Path -LiteralPath $numberingPath)) {
+            Write-Verbose "Creating numbering.xml with bullet list definition"
+            
+            # Define bullet characters and fonts for each level
+            $bulletDefs = @(
+                @{ Char = [char]0x2022; Font = "Symbol" },      # • bullet
+                @{ Char = [char]0x25E6; Font = "Symbol" },      # ◦ white circle
+                @{ Char = [char]0x25AA; Font = "Symbol" }       # ▪ small square
+            )
+            
+            # Create the XML structure
+            $sb = New-Object System.Text.StringBuilder
+            $null = $sb.AppendLine('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>')
+            $null = $sb.AppendLine('<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">')
+            $null = $sb.AppendLine('  <w:abstractNum w:abstractNumId="0">')
+            $null = $sb.AppendLine('    <w:nsid w:val="1BCA9C16"/>')
+            $null = $sb.AppendLine('    <w:multiLevelType w:val="hybridMultilevel"/>')
+            $null = $sb.AppendLine('    <w:tmpl w:val="7D26016A"/>')
+            
+            # Generate level definitions
+            for ($i = 0; $i -lt 9; $i++) {
+                $bulletDef = $bulletDefs[$i % 3]
+                $indent = 720 * ($i + 1)
+                
+                $null = $sb.AppendLine("    <w:lvl w:ilvl=""$i"" w:tplc=""0409000F"">")
+                $null = $sb.AppendLine('      <w:start w:val="1"/>')
+                $null = $sb.AppendLine('      <w:numFmt w:val="bullet"/>')
+                $null = $sb.AppendLine("      <w:lvlText w:val=""$($bulletDef.Char)""/>")
+                $null = $sb.AppendLine('      <w:lvlJc w:val="left"/>')
+                $null = $sb.AppendLine('      <w:pPr>')
+                $null = $sb.AppendLine("        <w:ind w:left=""$indent"" w:hanging=""360""/>")
+                $null = $sb.AppendLine('      </w:pPr>')
+                $null = $sb.AppendLine('      <w:rPr>')
+                $null = $sb.AppendLine("        <w:rFonts w:ascii=""$($bulletDef.Font)"" w:hAnsi=""$($bulletDef.Font)"" w:hint=""default""/>")
+                $null = $sb.AppendLine('      </w:rPr>')
+                $null = $sb.AppendLine('    </w:lvl>')
+            }
+            
+            # Close the XML structure
+            $null = $sb.AppendLine('  </w:abstractNum>')
+            $null = $sb.AppendLine('  <w:num w:numId="1">')
+            $null = $sb.AppendLine('    <w:abstractNumId w:val="0"/>')
+            $null = $sb.AppendLine('  </w:num>')
+            $null = $sb.AppendLine('</w:numbering>')
+            
+            # Write the XML with UTF-8 encoding
+            [System.IO.File]::WriteAllText($numberingPath, $sb.ToString(), [System.Text.Encoding]::UTF8)
+            
+            # Check if content types file exists
+            if (Test-Path -LiteralPath $contentTypesPath) {
+                # Update content types to include numbering
+                $contentTypesXml = [xml](Get-Content -LiteralPath $contentTypesPath | Out-String)
+                $nsManager = New-Object System.Xml.XmlNamespaceManager($contentTypesXml.NameTable)
+                $nsManager.AddNamespace("ct", "http://schemas.openxmlformats.org/package/2006/content-types")
+                
+                # Check if numbering content type already exists
+                $numberingType = $contentTypesXml.SelectSingleNode("//ct:Override[@PartName='/word/numbering.xml']", $nsManager)
+                if (-not $numberingType) {
+                    $numberingOverride = $contentTypesXml.CreateElement("Override", "http://schemas.openxmlformats.org/package/2006/content-types")
+                    $numberingOverride.SetAttribute("PartName", "/word/numbering.xml")
+                    $numberingOverride.SetAttribute("ContentType", "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml")
+                    $contentTypesXml.Types.AppendChild($numberingOverride) | Out-Null
+                    $contentTypesXml.Save($contentTypesPath)
+                }
+            } else {
+                Write-Warning "Content types file not found: $contentTypesPath"
+            }
+            
+            # Check if rels file exists
+            if (Test-Path -LiteralPath $relsPath) {
+                # Update document.xml.rels to include relationship to numbering.xml
+                $relsXml = [xml](Get-Content -LiteralPath $relsPath | Out-String)
+                $nsManager = New-Object System.Xml.XmlNamespaceManager($relsXml.NameTable)
+                $nsManager.AddNamespace("rel", "http://schemas.openxmlformats.org/package/2006/relationships")
+                
+                # Check if numbering relationship already exists
+                $numberingRel = $relsXml.SelectSingleNode("//rel:Relationship[@Target='numbering.xml']", $nsManager)
+                if (-not $numberingRel) {
+                    $maxId = 0
+                    foreach ($rel in $relsXml.Relationships.Relationship) {
+                        $idNum = [int]($rel.Id -replace "rId", "")
+                        if ($idNum -gt $maxId) { $maxId = $idNum }
+                    }
+                    
+                    $newRelId = "rId$($maxId + 1)"
+                    $newRel = $relsXml.CreateElement("Relationship", "http://schemas.openxmlformats.org/package/2006/relationships")
+                    $newRel.SetAttribute("Id", $newRelId)
+                    $newRel.SetAttribute("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering")
+                    $newRel.SetAttribute("Target", "numbering.xml")
+                    $relsXml.Relationships.AppendChild($newRel) | Out-Null
+                    $relsXml.Save($relsPath)
+                }
+            } else {
+                Write-Warning "Document rels file not found: $relsPath"
+            }
+        }
+        
+        # Check if document.xml exists
+        if (-not (Test-Path -LiteralPath $documentPath)) {
+            Write-Warning "Document XML not found: $documentPath"
+            return $false
+        }
+        
+        # Process document.xml to convert indented paragraphs to lists
+        Write-Verbose "Processing document to convert indents to bullet lists..."
+        
+        # Load the XML document
+        $docXml = New-Object System.Xml.XmlDocument
+        $docXml.Load($documentPath)
+        
+        $nsManager = New-Object System.Xml.XmlNamespaceManager($docXml.NameTable)
+        $nsManager.AddNamespace("w", "http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+        
+        # Find all paragraphs
+        $paragraphs = $docXml.SelectNodes("//w:p", $nsManager)
+        $paraCount = @($paragraphs).Count
+        Write-Verbose "Found $paraCount paragraphs"
+        
+        # Process paragraphs to identify content blocks
+        $blocks = @()
+        $currentBlock = $null
+        
+        foreach ($p in $paragraphs) {
+            # Extract paragraph info
+            $pPr = $p.SelectSingleNode(".//w:pPr", $nsManager)
+            $numPr = $null
+            $ind = $null
+            $leftIndent = 0
+            $isListItem = $false
+            $listLevel = -1
+            $listId = 0
+            
+            if ($null -ne $pPr) {
+                $numPr = $pPr.SelectSingleNode("./w:numPr", $nsManager)
+                $ind = $pPr.SelectSingleNode("./w:ind", $nsManager)
+                
+                if ($null -ne $ind -and $ind.HasAttribute("w:left")) {
+                    $leftIndent = [int]$ind.GetAttribute("left", "http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+                }
+                
+                if ($null -ne $numPr) {
+                    $isListItem = $true
+                    $ilvlNode = $numPr.SelectSingleNode("./w:ilvl", $nsManager)
+                    $numIdNode = $numPr.SelectSingleNode("./w:numId", $nsManager)
+                    
+                    if ($null -ne $ilvlNode) {
+                        $listLevel = [int]$ilvlNode.GetAttribute("val", "http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+                    }
+                    
+                    if ($null -ne $numIdNode) {
+                        $listId = [int]$numIdNode.GetAttribute("val", "http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+                    }
+                }
+            }
+            
+            # Get text content
+            $textNodes = $p.SelectNodes(".//w:t", $nsManager)
+            $text = ""
+            foreach ($t in $textNodes) {
+                $text += $t.InnerText
+            }
+            $text = $text.Trim()
+            
+            # Determine if this is a list/indented paragraph or regular text
+            $isFormattedItem = ($leftIndent -gt 0 -or $isListItem)
+            
+            # Start new block or continue current
+            if ($null -eq $currentBlock -or 
+                ($isFormattedItem -and $currentBlock.Type -eq "regular") -or
+                (-not $isFormattedItem -and $text -ne "" -and $currentBlock.Type -ne "regular")) {
+                
+                # Save current block if exists
+                if ($null -ne $currentBlock) {
+                    $blocks += $currentBlock
+                }
+                
+                # Create new block
+                $currentBlock = @{
+                    Type = if ($isFormattedItem) { "list" } else { "regular" }
+                    Items = @()
+                    FirstListId = if ($isListItem) { $listId } else { 0 }
+                }
+            }
+            
+            # Add to current block
+            $currentBlock.Items += @{
+                Paragraph = $p
+                IsListItem = $isListItem
+                ListLevel = $listLevel
+                ListId = $listId
+                Indent = $leftIndent
+                Text = $text
+            }
+            
+            # Update FirstListId if needed
+            if ($isListItem -and $currentBlock.FirstListId -eq 0) {
+                $currentBlock.FirstListId = $listId
+            }
+        }
+        
+        # Add final block
+        if ($null -ne $currentBlock) {
+            $blocks += $currentBlock
+        }
+        
+        $blockCount = @($blocks).Count
+        Write-Verbose "Identified $blockCount content blocks"
+        
+        # Process each block
+        foreach ($block in $blocks) {
+            # Skip regular text blocks
+            if ($block.Type -eq "regular") { continue }
+            
+            # Determine numId to use
+            $numIdToUse = if ($block.FirstListId -gt 0) { $block.FirstListId } else { 1 }
+            
+            # SIMPLE SEQUENTIAL APPROACH FOR PROPER NESTING
+            # First pass: Find unique indentation values
+            $indents = @{}
+            
+            foreach ($item in $block.Items) {
+                if ($item.Indent -gt 0) {
+                    $indents[$item.Indent] = $true
+                }
+            }
+            
+            # Sort indentation values
+            $sortedIndents = @($indents.Keys) | Sort-Object
+            
+            # Second pass: Process paragraphs sequentially
+            $prevIndent = 0
+            $currentLevel = -1
+            $indentLevels = @{}
+            
+            foreach ($item in $block.Items) {
+                $p = $item.Paragraph
+                $pPr = $p.SelectSingleNode(".//w:pPr", $nsManager)
+                
+                if ($null -eq $pPr) {
+                    $pPr = $docXml.CreateElement("w:pPr", "http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+                    $p.PrependChild($pPr) | Out-Null
+                }
+                
+                # Skip if already a list item and we want to preserve it
+                if ($item.IsListItem -and $item.ListId -eq $numIdToUse) {
+                    Write-Verbose "Preserving existing list item with level $($item.ListLevel) and numId $($item.ListId)"
+                    continue
+                }
+                
+                # Remove existing numPr and indentation
+                $existingNumPr = $pPr.SelectSingleNode("./w:numPr", $nsManager)
+                if ($null -ne $existingNumPr) {
+                    $pPr.RemoveChild($existingNumPr) | Out-Null
+                }
+                
+                $ind = $pPr.SelectSingleNode("./w:ind", $nsManager)
+                if ($null -ne $ind) {
+                    $pPr.RemoveChild($ind) | Out-Null
+                }
+                
+                # Calculate list level based on relative indentation
+                $level = 0
+                
+                if ($item.Indent -gt 0) {
+                    # If this is the first item or indentation changed
+                    if (($currentLevel -eq -1) -or (-not $indentLevels.ContainsKey($item.Indent))) {
+                        # First occurrence of this indent
+                        if ($item.Indent -gt $prevIndent) {
+                            # Indent increased - go one level deeper
+                            $level = $currentLevel + 1
+                        } else {
+                            # Indent decreased or first item - use level 0
+                            $level = 0
+                        }
+                        $indentLevels[$item.Indent] = $level
+                    } else {
+                        # We've seen this indent before
+                        $level = $indentLevels[$item.Indent]
+                    }
+                }
+                
+                # Ensure level is within range 0-8
+                $level = [Math]::Min([Math]::Max($level, 0), 8)
+                
+                # Create new numPr
+                $numPr = $docXml.CreateElement("w:numPr", "http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+                
+                # Set level
+                $ilvl = $docXml.CreateElement("w:ilvl", "http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+                $ilvl.SetAttribute("val", "http://schemas.openxmlformats.org/wordprocessingml/2006/main", $level.ToString())
+                $numPr.AppendChild($ilvl) | Out-Null
+                
+                # Set numId
+                $numIdElement = $docXml.CreateElement("w:numId", "http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+                $numIdElement.SetAttribute("val", "http://schemas.openxmlformats.org/wordprocessingml/2006/main", $numIdToUse.ToString())
+                $numPr.AppendChild($numIdElement) | Out-Null
+                
+                # Add numPr to paragraph properties
+                $pPr.AppendChild($numPr) | Out-Null
+                
+                Write-Verbose "Converted paragraph with indent $($item.Indent) to bullet with level $level and numId $numIdToUse"
+                
+                # Update tracking variables
+                $prevIndent = $item.Indent
+                $currentLevel = $level
+            }
+        }
+        
+        # Save the document
+        $docXml.Save($documentPath)
+        
+        # Repackage the DOCX
+        Write-Verbose "Repackaging DOCX file..."
+        $tempFile = [System.IO.Path]::GetTempFileName()
+        if (Test-Path $tempFile) { Remove-Item $tempFile -Force }
+        
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($tempDir, $tempFile)
+        
+        # Replace the original file
+        Move-Item -Path $tempFile -Destination $FilePath -Force
+        
+        Write-Verbose "Successfully converted indented paragraphs to bullet lists in: $FilePath"
+        return $true
+    }
+    catch {
+        Write-Error "Error converting indented paragraphs: $_"
+        return $false
+    }
+    finally {
+        # Clean up temp directory
+        if (Test-Path $tempDir) {
+            Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+
+
+function Update-DocxReferences {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [hashtable]$Paths
+    )
+    
+    # Update content types to include numbering
+    if (Test-Path -LiteralPath $Paths.ContentTypes) {
+        $contentTypesXml = [xml](Get-Content -LiteralPath $Paths.ContentTypes | Out-String)
+        $nsManager = New-Object System.Xml.XmlNamespaceManager($contentTypesXml.NameTable)
+        $nsManager.AddNamespace("ct", "http://schemas.openxmlformats.org/package/2006/content-types")
+        
+        $numberingType = $contentTypesXml.SelectSingleNode("//ct:Override[@PartName='/word/numbering.xml']", $nsManager)
+        if (-not $numberingType) {
+            $numberingOverride = $contentTypesXml.CreateElement("Override", "http://schemas.openxmlformats.org/package/2006/content-types")
+            $numberingOverride.SetAttribute("PartName", "/word/numbering.xml")
+            $numberingOverride.SetAttribute("ContentType", "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml")
+            $contentTypesXml.Types.AppendChild($numberingOverride) | Out-Null
+            $contentTypesXml.Save($Paths.ContentTypes)
+            Write-Verbose "Updated content types to include numbering"
+        }
+    }
+    
+    # Update relationships to include numbering
+    if (Test-Path -LiteralPath $Paths.Relationships) {
+        $relsXml = [xml](Get-Content -LiteralPath $Paths.Relationships | Out-String)
+        $nsManager = New-Object System.Xml.XmlNamespaceManager($relsXml.NameTable)
+        $nsManager.AddNamespace("rel", "http://schemas.openxmlformats.org/package/2006/relationships")
+        
+        $numberingRel = $relsXml.SelectSingleNode("//rel:Relationship[@Target='numbering.xml']", $nsManager)
+        if (-not $numberingRel) {
+            $maxId = 0
+            foreach ($rel in $relsXml.Relationships.Relationship) {
+                $idNum = [int]($rel.Id -replace "rId", "")
+                if ($idNum -gt $maxId) { $maxId = $idNum }
+            }
+            
+            $newRelId = "rId$($maxId + 1)"
+            $newRel = $relsXml.CreateElement("Relationship", "http://schemas.openxmlformats.org/package/2006/relationships")
+            $newRel.SetAttribute("Id", $newRelId)
+            $newRel.SetAttribute("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering")
+            $newRel.SetAttribute("Target", "numbering.xml")
+            $relsXml.Relationships.AppendChild($newRel) | Out-Null
+            $relsXml.Save($Paths.Relationships)
+            Write-Verbose "Updated relationships to include numbering"
+        }
+    }
+}
+
+function Convert-DocxIndentsToBullets {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]$DocumentPath
+    )
+    
+    # Load the XML document
+    $docXml = New-Object System.Xml.XmlDocument
+    $docXml.Load($DocumentPath)
+    
+    $nsManager = New-Object System.Xml.XmlNamespaceManager($docXml.NameTable)
+    $nsManager.AddNamespace("w", "http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+    
+    # Find all paragraphs
+    $paragraphs = $docXml.SelectNodes("//w:p", $nsManager)
+    $paraCount = @($paragraphs).Count
+    Write-Verbose "Found $paraCount paragraphs"
+    
+    # Group indented paragraphs
+    $groups = @()
+    $currentGroup = $null
+    
+    foreach ($p in $paragraphs) {
+        # Skip if already a list
+        $numPr = $p.SelectSingleNode(".//w:numPr", $nsManager)
+        if ($numPr) {
+            if ($null -ne $currentGroup) {
+                $groups += $currentGroup
+                $currentGroup = $null
+            }
+            continue
+        }
+        
+        # Check for indentation
+        $ind = $p.SelectSingleNode(".//w:pPr/w:ind", $nsManager)
+        $leftIndent = 0
+        if ($null -ne $ind -and $ind.HasAttribute("w:left")) {
+            $leftIndent = [int]$ind.GetAttribute("left", "http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+        }
+        
+        if ($leftIndent -gt 0) {
+            # Start or continue group
+            if ($null -eq $currentGroup) {
+                $currentGroup = @{
+                    Paragraphs = @()
+                    Indents = @{}
+                }
+            }
+            
+            $currentGroup.Paragraphs += $p
+            $currentGroup.Indents[$leftIndent] = $true
+        }
+        elseif ($null -ne $currentGroup) {
+            # End current group
+            $groups += $currentGroup
+            $currentGroup = $null
+        }
+    }
+    
+    # Add final group if exists
+    if ($null -ne $currentGroup) {
+        $groups += $currentGroup
+    }
+    
+    $groupCount = @($groups).Count
+    Write-Verbose "Found $groupCount groups of indented paragraphs"
+    if ($groupCount -eq 0) { return $false }
+    
+    # Process each group
+    foreach ($group in $groups) {
+        if ($null -eq $group) { continue }
+        
+        $paragraphCount = @($group.Paragraphs).Count
+        if ($paragraphCount -eq 0) { continue }
+        
+        # Sort indentation levels
+        $indentLevels = @($group.Indents.Keys) | Sort-Object
+        $levelMap = @{}
+        
+        # Create simple sequential mapping
+        for ($i = 0; $i -lt @($indentLevels).Count; $i++) {
+            $levelMap[$indentLevels[$i]] = $i
+            Write-Verbose "Mapping indent $($indentLevels[$i]) to level $i"
+        }
+        
+        # Convert each paragraph in the group
+        foreach ($p in $group.Paragraphs) {
+            $pPr = $p.SelectSingleNode(".//w:pPr", $nsManager)
+            if ($null -eq $pPr) {
+                $pPr = $docXml.CreateElement("w:pPr", "http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+                $p.PrependChild($pPr) | Out-Null
+            }
+            
+            # Get indentation and remove it
+            $ind = $pPr.SelectSingleNode("./w:ind", $nsManager)
+            $leftIndent = 0
+            if ($null -ne $ind -and $ind.HasAttribute("w:left")) {
+                $leftIndent = [int]$ind.GetAttribute("left", "http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+                $pPr.RemoveChild($ind) | Out-Null
+            }
+            
+            # Get mapped level and ensure it's in range
+            $level = $levelMap[$leftIndent]
+            $level = [Math]::Min([Math]::Max($level, 0), 8)
+            
+            # Create list formatting
+            $numPr = $docXml.CreateElement("w:numPr", "http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+            
+            # Set list level
+            $ilvl = $docXml.CreateElement("w:ilvl", "http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+            $ilvl.SetAttribute("val", "http://schemas.openxmlformats.org/wordprocessingml/2006/main", $level.ToString())
+            $numPr.AppendChild($ilvl) | Out-Null
+            
+            # Set list ID
+            $numId = $docXml.CreateElement("w:numId", "http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+            $numId.SetAttribute("val", "http://schemas.openxmlformats.org/wordprocessingml/2006/main", "1")
+            $numPr.AppendChild($numId) | Out-Null
+            
+            # Add to paragraph
+            $pPr.AppendChild($numPr) | Out-Null
+        }
+    }
+    
+    # Save the document
+    $docXml.Save($DocumentPath)
+    return $true
+}
+
 
 
 Function Get-DefaultConfiguration {
